@@ -240,7 +240,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 apply_api_update_debounce(updated_day_data, LAST_DAY_DATA, "day")
                 LAST_DAY_DATA = updated_day_data
             else:
-                # integrate the minute data
+                # integrate minute data on top of the last API-provided daily total
                 _LOGGER.info("Integrating minute data into day sensors")
                 if LAST_MINUTE_DATA:
                     for identifier, data in LAST_MINUTE_DATA.items():
@@ -254,10 +254,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             and "usage" in LAST_DAY_DATA[day_id]
                             and LAST_DAY_DATA[day_id]["usage"] is not None
                         ):
-                            # if we just passed midnight, then reset back to zero
-                            timestamp: datetime = data["timestamp"]
-                            await check_for_midnight(timestamp, int(device_gid), day_id)
-
                             LAST_DAY_DATA[day_id]["usage"] += data[
                                 "usage"
                             ]  # already in kwh
@@ -278,7 +274,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 LAST_MONTH_DATA = updated_month_data
             else:
-                # integrate the minute data
+                # integrate minute data on top of the last API-provided monthly total
                 _LOGGER.info("Integrating minute data into month sensors")
                 if LAST_MINUTE_DATA:
                     for identifier, data in LAST_MINUTE_DATA.items():
@@ -292,10 +288,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             and "usage" in LAST_MONTH_DATA[month_id]
                             and LAST_MONTH_DATA[month_id]["usage"] is not None
                         ):
-                            # if we just passed the billing cycle start, reset back to zero
-                            timestamp: datetime = data["timestamp"]
-                            await check_for_new_month(timestamp, int(device_gid), month_id)
-
                             LAST_MONTH_DATA[month_id]["usage"] += data[
                                 "usage"
                             ]  # already in kwh
@@ -725,58 +717,6 @@ async def change_time_to_local(time: datetime, tz_string: str) -> datetime:
     return time.astimezone(tz_info)
 
 
-async def check_for_midnight(timestamp: datetime, device_gid: int, day_id: str):
-    """If midnight has recently passed, reset the LAST_DAY_DATA for Day sensors to zero."""
-    if device_gid in DEVICE_INFORMATION:
-        device_info: VueDevice = DEVICE_INFORMATION[device_gid]
-        local_time: datetime = await change_time_to_local(
-            timestamp, device_info.time_zone
-        )
-        local_midnight: datetime = local_time.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        last_reset = LAST_DAY_DATA[day_id]["reset"]
-        if local_midnight > last_reset:
-            # New reset time found
-            _LOGGER.info(
-                "Midnight happened recently for id %s! Timestamp is %s, midnight is %s, "
-                "previous reset was %s",
-                day_id,
-                local_time,
-                local_midnight,
-                last_reset,
-            )
-            LAST_DAY_DATA[day_id]["usage"] = 0
-            LAST_DAY_DATA[day_id]["reset"] = local_midnight
-
-
-async def check_for_new_month(timestamp: datetime, device_gid: int, month_id: str):
-    """If a new billing cycle has started, reset the LAST_MONTH_DATA for Month sensors to zero."""
-    if device_gid in DEVICE_INFORMATION:
-        device_info: VueDevice = DEVICE_INFORMATION[device_gid]
-        local_time: datetime = await change_time_to_local(
-            timestamp, device_info.time_zone
-        )
-        current_reset: datetime = determine_reset_datetime(
-            local_time,
-            device_info.billing_cycle_start_day,
-            True,
-        )
-        last_reset = LAST_MONTH_DATA[month_id]["reset"]
-        if current_reset > last_reset:
-            # New billing cycle started
-            _LOGGER.info(
-                "New billing cycle started for id %s! Timestamp is %s, "
-                "current reset is %s, previous reset was %s",
-                month_id,
-                local_time,
-                current_reset,
-                last_reset,
-            )
-            LAST_MONTH_DATA[month_id]["usage"] = 0
-            LAST_MONTH_DATA[month_id]["reset"] = current_reset
-
-
 def determine_reset_datetime(
     local_time: datetime, monthly_cycle_start: int, is_month: bool
 ) -> datetime:
@@ -831,11 +771,11 @@ def apply_api_update_debounce(
     existing_data: dict[str, Any],
     scale_name: str,
 ) -> None:
-    """Prevent API reset lag from inflating totals shortly after local reset time.
+    """Debounce API updates shortly after expected reset while keeping resets API-led.
 
-    During the debounce window after reset, API values may lag and still include prior
-    period usage. In that case, allow API values to lower totals but not raise them
-    above the minute-integrated value already tracked in memory.
+    Reset/rollover timing is API-led: minute integration runs on top of the last
+    API-provided total. During the reset debounce window, stale higher API totals
+    from the prior period should not overwrite lower integrated values.
     """
     if not updated_data or not existing_data:
         return
